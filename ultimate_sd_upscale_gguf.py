@@ -59,10 +59,10 @@ class UltimateSDUpscaleGGUF:
             force_uniform_tiles=force_uniform_tiles
         )
 
-        # Step 2: Upscale image using bicubic (keep on CPU)
+        # Step 2: Upscale image using bicubic
         samples = image.movedim(-1,1)  # BHWC to BCHW
-        image = comfy.utils.common_upscale(samples, settings.target_width, settings.target_height, "bicubic", "disabled")
-        image = image.movedim(1,-1)  # BCHW to BHWC and ensure CPU
+        image = comfy.utils.common_upscale(samples, settings.sampling_width, settings.sampling_height, "bicubic", "disabled")
+        image = image.movedim(1,-1)  # BCHW to BHWC
         
         # Create output tensor on CPU
         output = torch.zeros_like(image)
@@ -74,10 +74,10 @@ class UltimateSDUpscaleGGUF:
                 # Get tile coordinates with padding
                 x1, x2, y1, y2, pad_x1, pad_x2, pad_y1, pad_y2 = settings.get_tile_coordinates(tile_x, tile_y, tile_padding)
                 
-                # Step 3: Extract padded tile (keep on CPU)
+                # Step 3: Extract padded tile
                 tile = image[:, pad_y1:pad_y2, pad_x1:pad_x2, :].clone()  # Clone to ensure memory separation
                 
-                # Step 4-5: Create and pad mask (on CPU first)
+                # Step 4-5: Create and pad mask
                 mask = torch.ones((1, 1, y2-y1, x2-x1))
                 if tile_padding > 0:
                     padded_mask = torch.nn.functional.pad(mask, (tile_padding,)*4, mode='constant', value=0)
@@ -115,7 +115,13 @@ class UltimateSDUpscaleGGUF:
                 tile_samples = Sampler.sample(noise, guider, sampler, sigmas, tile_samples)
                 tile = vae.decode(tile_samples["samples"])
 
-                # Step 10: Paste tile back
-                output[:, y1:y2, x1:x2, :] = tile[:, :y2-y1, :x2-x1, :]
+                # Step 10: Paste tile back with mask
+                output[:, y1:y2, x1:x2, :] = tile * mask + \
+                    tile[:, :y2-y1, :x2-x1, :] * (1 - mask)
+
+        # Scale image back down to target size
+        samples = output.movedim(-1,1)  # BHWC to BCHW
+        image = comfy.utils.common_upscale(samples, settings.target_width, settings.target_height, "area", "disabled")
+        output = image.movedim(1,-1)  # BCHW to BHWC
         
         return (output,)
