@@ -1,21 +1,20 @@
 import torch
+import os
+import sys
+
+# Add ComfyUI path to sys.path
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+COMFY_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
+if COMFY_DIR not in sys.path:
+    sys.path.append(COMFY_DIR)
+
 from .upscale_settings import UpscaleSettings
 from .sampler import Sampler
 
 class SeamFixer:
     VALID_MODES = ["None", "Band Pass", "Half Tile", "Half Tile + Intersections"]
     
-    def __init__(self, mode: str, width: int, mask_blur: int, padding: int, transition_sharpness: float, settings: UpscaleSettings, device):
-        """Initialize the SeamFixer
-        
-        Args:
-            mode (str): Seam fixing mode, one of: "None", "Band Pass", "Half Tile", "Half Tile + Intersections"
-            width (int): Width of the seam fix area
-            mask_blur (int): Blur amount for the seam mask
-            padding (int): Padding around the seam area
-            settings (UpscaleSettings): Settings for tile dimensions and coordinates
-            device: The torch device to use
-        """
+    def __init__(self, mode, width, mask_blur, padding, transition_sharpness, settings, device):
         if mode not in self.VALID_MODES:
             raise ValueError(f"Invalid seam fix mode: {mode}. Must be one of {self.VALID_MODES}")
             
@@ -28,12 +27,6 @@ class SeamFixer:
         self.device = device
     
     def get_band_coordinates(self):
-        """Get coordinates for all vertical and horizontal bands
-        
-        Returns:
-            tuple: Lists of (vertical_bands, horizontal_bands)
-            Each band is a tuple of (start_x, end_x, start_y, end_y)
-        """
         vertical_bands = []
         horizontal_bands = []
         
@@ -58,12 +51,6 @@ class SeamFixer:
         return vertical_bands, horizontal_bands
     
     def get_half_tile_coordinates(self):
-        """Get coordinates for half-tiles along seams
-        
-        Returns:
-            tuple: Lists of (vertical_halves, horizontal_halves)
-            Each item is a tuple of (start_x, end_x, start_y, end_y)
-        """
         vertical_halves = []
         horizontal_halves = []
         
@@ -114,11 +101,6 @@ class SeamFixer:
         return vertical_halves, horizontal_halves
         
     def get_intersection_coordinates(self):
-        """Get coordinates for intersection regions where tiles meet
-        
-        Returns:
-            list: List of intersection regions as (start_x, end_x, start_y, end_y)
-        """
         intersections = []
         
         # For each internal tile corner (where 4 tiles meet)
@@ -143,58 +125,49 @@ class SeamFixer:
         
         return intersections
         
-    def process_band(self, upscaled_image: torch.Tensor, band: tuple, vae, sampler, noise, guider, sigmas) -> torch.Tensor:
-        """Process a single band to fix seams
-        
-        Args:
-            upscaled_image: Full upscaled image
-            band: Tuple of (start_x, end_x, start_y, end_y)
-            vae, sampler, noise, guider, sigmas: Required for processing
-        
-        Returns:
-            Processed band with same dimensions as input band
-        """
+    def process_band(self, upscaled_image, band, vae, sampler, noise, guider, sigmas):
         start_x, end_x, start_y, end_y = band
         
-        # Extract band from image
+        # Extract band region
         band_image = upscaled_image[:, start_y:end_y, start_x:end_x, :]
         
-        # Create mask for blending
+        # Create mask for blending (in BCHW for conv2d)
         mask = torch.zeros((1, 1, end_y - start_y, end_x - start_x), device=self.device)
         mask[:, :, :, :] = 1
         
         # Apply mask blur if specified
         if self.mask_blur > 0:
             adjusted_blur = self.mask_blur * self.transition_sharpness
-            kernel_size = int(adjusted_blur * 2 + 1)
-            kernel = torch.ones(1, 1, kernel_size, kernel_size, device=self.device)
-            kernel = kernel / kernel.numel()
-            mask = torch.nn.functional.conv2d(
-                mask,
-                kernel,
-                padding=self.mask_blur
+            # Ensure kernel size is odd and not larger than input
+            kernel_size = min(
+                int(adjusted_blur * 2 + 1),
+                min(end_y - start_y, end_x - start_x) - 1  # Leave at least 1 pixel
             )
-            mask = torch.clamp(mask, 0, 1)
+            if kernel_size % 2 == 0:  # Make odd
+                kernel_size -= 1
+            if kernel_size > 0:  # Only apply if we have a valid kernel size
+                kernel = torch.ones(1, 1, kernel_size, kernel_size, device=self.device)
+                kernel = kernel / kernel.numel()
+                mask = torch.nn.functional.conv2d(
+                    mask,
+                    kernel,
+                    padding=kernel_size//2
+                )
+                mask = torch.clamp(mask, 0, 1)
         
-        # Process through VAE and sampling
+        # Process through VAE and sampling (VAE expects BHWC format)
         latent = Sampler.encode(band_image, vae)
-        latent["noise_mask"] = mask
+        latent["noise_mask"] = mask  # Noise mask stays in BCHW format
         
         sampled = Sampler.sample(noise, guider, sampler, sigmas, latent)
         processed_band = vae.decode(sampled["samples"])
         
+        # Convert mask to BHWC for blending
+        mask = mask.permute(0, 2, 3, 1)
+        
         return processed_band, mask
         
-    def fix_seams(self, upscaled_image: torch.Tensor, vae, sampler, noise, guider, sigmas) -> torch.Tensor:
-        """Fix seams in the upscaled image based on the specified mode
-        
-        Args:
-            upscaled_image (torch.Tensor): The upscaled image with seams
-            vae, sampler, noise, guider, sigmas: Required components for processing
-            
-        Returns:
-            torch.Tensor: The image with fixed seams
-        """
+    def fix_seams(self, upscaled_image, vae, sampler, noise, guider, sigmas):
         if self.mode == "None":
             return upscaled_image
             
@@ -209,13 +182,12 @@ class SeamFixer:
                     upscaled_image, band, vae, sampler, noise, guider, sigmas
                 )
                 start_x, end_x, start_y, end_y = band
-                mask = mask.squeeze(1)
                 
                 # Blend band back into image
-                for c in range(upscaled_image.shape[-1]):  # For each channel
+                for c in range(upscaled_image.shape[-1]):
                     result_image[:, start_y:end_y, start_x:end_x, c] = \
-                        processed_band[:, :, :, c] * mask + \
-                        result_image[:, start_y:end_y, start_x:end_x, c] * (1 - mask)
+                        processed_band[:, :, :, c] * mask[:, :, :, 0] + \
+                        result_image[:, start_y:end_y, start_x:end_x, c] * (1 - mask[:, :, :, 0])
             
             # Process horizontal bands
             for band in horizontal_bands:
@@ -223,13 +195,12 @@ class SeamFixer:
                     result_image, band, vae, sampler, noise, guider, sigmas
                 )
                 start_x, end_x, start_y, end_y = band
-                mask = mask.squeeze(1)
                 
                 # Blend band back into image
                 for c in range(upscaled_image.shape[-1]):
                     result_image[:, start_y:end_y, start_x:end_x, c] = \
-                        processed_band[:, :, :, c] * mask + \
-                        result_image[:, start_y:end_y, start_x:end_x, c] * (1 - mask)
+                        processed_band[:, :, :, c] * mask[:, :, :, 0] + \
+                        result_image[:, start_y:end_y, start_x:end_x, c] * (1 - mask[:, :, :, 0])
                         
         elif self.mode in ["Half Tile", "Half Tile + Intersections"]:
             vertical_halves, horizontal_halves = self.get_half_tile_coordinates()
@@ -240,13 +211,12 @@ class SeamFixer:
                     upscaled_image, half_tile, vae, sampler, noise, guider, sigmas
                 )
                 start_x, end_x, start_y, end_y = half_tile
-                mask = mask.squeeze(1)
                 
                 # Blend half-tile back into image
                 for c in range(upscaled_image.shape[-1]):
                     result_image[:, start_y:end_y, start_x:end_x, c] = \
-                        processed_half[:, :, :, c] * mask + \
-                        result_image[:, start_y:end_y, start_x:end_x, c] * (1 - mask)
+                        processed_half[:, :, :, c] * mask[:, :, :, 0] + \
+                        result_image[:, start_y:end_y, start_x:end_x, c] * (1 - mask[:, :, :, 0])
             
             # Process horizontal half-tiles
             for half_tile in horizontal_halves:
@@ -254,13 +224,12 @@ class SeamFixer:
                     result_image, half_tile, vae, sampler, noise, guider, sigmas
                 )
                 start_x, end_x, start_y, end_y = half_tile
-                mask = mask.squeeze(1)
                 
                 # Blend half-tile back into image
                 for c in range(upscaled_image.shape[-1]):
                     result_image[:, start_y:end_y, start_x:end_x, c] = \
-                        processed_half[:, :, :, c] * mask + \
-                        result_image[:, start_y:end_y, start_x:end_x, c] * (1 - mask)
+                        processed_half[:, :, :, c] * mask[:, :, :, 0] + \
+                        result_image[:, start_y:end_y, start_x:end_x, c] * (1 - mask[:, :, :, 0])
             
             # Process intersections if in intersection mode
             if self.mode == "Half Tile + Intersections":
@@ -272,7 +241,6 @@ class SeamFixer:
                         result_image, intersection, vae, sampler, noise, guider, sigmas
                     )
                     start_x, end_x, start_y, end_y = intersection
-                    mask = mask.squeeze(1)
                     
                     # Use radial gradient for intersection mask
                     # This creates a circular blend that smoothly transitions in all directions
@@ -288,9 +256,10 @@ class SeamFixer:
                     radial_mask = torch.clamp(1 - radius / max_radius, 0, 1)
                     
                     # Blend intersection back into image
+                    radial_mask = radial_mask.unsqueeze(-1)  # Add channel dimension
                     for c in range(upscaled_image.shape[-1]):
                         result_image[:, start_y:end_y, start_x:end_x, c] = \
-                            processed_intersection[:, :, :, c] * radial_mask + \
-                            result_image[:, start_y:end_y, start_x:end_x, c] * (1 - radial_mask)
+                            processed_intersection[:, :, :, c] * radial_mask[:, :, :, 0] + \
+                            result_image[:, start_y:end_y, start_x:end_x, c] * (1 - radial_mask[:, :, :, 0])
             
         return result_image
