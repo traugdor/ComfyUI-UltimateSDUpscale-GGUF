@@ -47,9 +47,9 @@ class UpscaleSettings:
         sampling_width = self.target_width
         sampling_height = self.target_height
         if self.target_width % 8 != 0:
-            sampling_width  = (self.target_width / 8 + 1) * 8
+            sampling_width  = (self.target_width // 8 + 1) * 8
         if self.target_height % 8 != 0:
-            sampling_height = (self.target_height / 8 + 1) * 8
+            sampling_height = (self.target_height // 8 + 1) * 8
         
         # For non-uniform tiles, use square tiles
         tile_size = max(64, math.ceil(self.max_tile_size / 8) * 8)
