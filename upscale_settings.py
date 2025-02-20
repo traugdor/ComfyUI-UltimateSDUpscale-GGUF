@@ -22,11 +22,11 @@ class UpscaleSettings:
         if self.target_width > self.target_height:
             self.num_tiles_x = math.ceil(self.target_width / self.max_tile_size)
             max_tile_width = self.max_tile_size
-            max_tile_height = math.ceil(self.max_tile_size * (self.target_height / self.target_width) // 8 ) * 8
+            max_tile_height = math.ceil(self.max_tile_size * (self.target_height / self.target_width) / 8 ) * 8
             self.num_tiles_y = math.ceil(self.target_height / max_tile_height)
         else:
             self.num_tiles_y = math.ceil(self.target_height / self.max_tile_size)
-            max_tile_width = math.ceil(self.max_tile_size * (self.target_width / self.target_height) // 8 ) * 8
+            max_tile_width = math.ceil(self.max_tile_size * (self.target_width / self.target_height) / 8 ) * 8
             max_tile_height = self.max_tile_size
             self.num_tiles_x = math.ceil(self.target_width / max_tile_width)
 
@@ -47,9 +47,9 @@ class UpscaleSettings:
         sampling_width = self.target_width
         sampling_height = self.target_height
         if self.target_width % 8 != 0:
-            sampling_width  = (self.target_width // 8 + 1) * 8
+            sampling_width  = (self.target_width / 8 + 1) * 8
         if self.target_height % 8 != 0:
-            sampling_height = (self.target_height // 8 + 1) * 8
+            sampling_height = (self.target_height / 8 + 1) * 8
         
         # For non-uniform tiles, use square tiles
         tile_size = max(64, math.ceil(self.max_tile_size / 8) * 8)
