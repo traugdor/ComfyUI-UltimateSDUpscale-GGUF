@@ -65,11 +65,11 @@ class UpscaleSettings:
         if not (0 <= tile_x < self.num_tiles_x and 0 <= tile_y < self.num_tiles_y):
             return None, None, None, None
             
-        # Calculate base tile coordinates without padding
+        # Calculate base tile coordinates in sampling space
         x1 = tile_x * self.tile_width
-        x2 = min((tile_x + 1) * self.tile_width, self.target_width)
+        x2 = min((tile_x + 1) * self.tile_width, self.sampling_width)
         y1 = tile_y * self.tile_height
-        y2 = min((tile_y + 1) * self.tile_height, self.target_height)
+        y2 = min((tile_y + 1) * self.tile_height, self.sampling_height)
         
         # Add padding only at seams
         pad_left = tile_padding if tile_x > 0 else 0
@@ -79,10 +79,12 @@ class UpscaleSettings:
         
         # Apply padding to coordinates
         pad_x1 = max(0, x1 - pad_left)
-        pad_x2 = min(self.target_width, x2 + pad_right)
+        pad_x2 = min(self.sampling_width, x2 + pad_right)
         pad_y1 = max(0, y1 - pad_top)
-        pad_y2 = min(self.target_height, y2 + pad_bottom)
+        pad_y2 = min(self.sampling_height, y2 + pad_bottom)
         
+        # All coordinates are already multiples of 8 due to how sampling_width/height
+        # and tile_width/height are calculated
         return x1, x2, y1, y2, pad_x1, pad_x2, pad_y1, pad_y2
 
     def get_tile_mask_area(self, tile_width, tile_height, tile_padding):

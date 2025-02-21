@@ -15,7 +15,7 @@ if COMFY_DIR not in sys.path:
 
 import comfy.utils
 from .upscale_settings import UpscaleSettings
-from .sampler import Sampler
+from .sampler import SamplerHelper, Sampler
 from .seam_fixer import SeamFixer
 
 class UltimateSDUpscaleGGUF:
@@ -64,64 +64,89 @@ class UltimateSDUpscaleGGUF:
         image = comfy.utils.common_upscale(samples, settings.sampling_width, settings.sampling_height, "bicubic", "disabled")
         image = image.movedim(1,-1)  # BCHW to BHWC
         
-        # Create output tensor on CPU
-        output = torch.zeros_like(image)
+        # Create output tensor on CPU to save VRAM
+        output = torch.zeros_like(image, device='cpu')
         
-        # Process each tile
+        # Initialize storage for our phases
+        latents = []
+        tile_positions = []
+        
+        # Phase 1: VAE Encode
+        print("Phase 1: VAE Encoding")
+        print("Cleaning VRAM...")
+        SamplerHelper.force_memory_cleanup(True)  # Ensure clean VRAM state
+        
         for tile_y in range(settings.num_tiles_y):
             for tile_x in range(settings.num_tiles_x):
-                
                 # Get tile coordinates with padding
                 x1, x2, y1, y2, pad_x1, pad_x2, pad_y1, pad_y2 = settings.get_tile_coordinates(tile_x, tile_y, tile_padding)
                 
-                # Step 3: Extract padded tile
-                tile = image[:, pad_y1:pad_y2, pad_x1:pad_x2, :].clone()  # Clone to ensure memory separation
+                # Extract padded tile
+                tile = image[:, pad_y1:pad_y2, pad_x1:pad_x2, :].clone()
                 
-                # Step 4-5: Create and pad mask
-                mask = torch.ones((1, 1, y2-y1, x2-x1))
-                if tile_padding > 0:
-                    padded_mask = torch.nn.functional.pad(mask, (tile_padding,)*4, mode='constant', value=0)
-                else:
-                    padded_mask = mask
-
-                # Step 6: Blur mask edges (on CPU)
-                if mask_blur > 0:
-                    kernel_size = mask_blur * 2 + 1
-                    kernel = torch.ones(1, 1, kernel_size, kernel_size) / (kernel_size * kernel_size)
-                    padded_mask = torch.nn.functional.conv2d(
-                        padded_mask, kernel, padding=mask_blur
-                    )
-                    padded_mask = torch.clamp(padded_mask * (1 + transition_sharpness), 0, 1)
-
-                # Step 7: Crop mask edges for edge tiles
-                if pad_x1 == 0:  # Left edge
-                    padded_mask = padded_mask[:, :, :, tile_padding:]
-                if pad_x2 == settings.target_width:  # Right edge
-                    padded_mask = padded_mask[:, :, :, :-tile_padding]
-                if pad_y1 == 0:  # Top edge
-                    padded_mask = padded_mask[:, :, tile_padding:, :]
-                if pad_y2 == settings.target_height:  # Bottom edge
-                    padded_mask = padded_mask[:, :, :-tile_padding, :]
-
-                # Step 8-9: Sample and decode tile
-                tile_latent = Sampler.encode(tile, vae)
+                # Encode tile
+                latent = Sampler.encode(tile, vae)
+                latents.append(latent)
+                tile_positions.append((x1, x2, y1, y2, pad_x1, pad_x2, pad_y1, pad_y2))
                 
-                #scale mask to match tile size
-                latent_h, latent_w = tile_latent["samples"].shape[2:]
-                padded_mask = F.interpolate(padded_mask, size=(latent_h, latent_w), mode='bilinear')
-                
-                tile_samples = {"samples": tile_latent["samples"], "noise_mask": padded_mask}
-                
-                tile_samples = Sampler.sample(noise, guider, sampler, sigmas, tile_samples)
-                tile = vae.decode(tile_samples["samples"])
-
-                # Step 10: Paste tile back with mask
-                output[:, y1:y2, x1:x2, :] = tile * mask + \
-                    tile[:, :y2-y1, :x2-x1, :] * (1 - mask)
-
+                del tile
+                torch.cuda.empty_cache()
+        
+        # Unload VAE to free memory
+        print("Unloading VAE...")
+        SamplerHelper.force_memory_cleanup(True)
+        
+        # Phase 2: Process Latents
+        print("Phase 2: Processing Latents")
+        processed_latents = SamplerHelper.process_latent_batch(latents, noise, guider, sampler, sigmas)
+        
+        # Clear original latents
+        del latents
+        print("Cleaning VRAM...")
+        SamplerHelper.force_memory_cleanup(True)
+        
+        # Phase 3: VAE Decode
+        print("Phase 3: VAE Decoding")
+        decoded_tiles = []
+        
+        for processed_latent in processed_latents:
+            # Decode latent
+            tile = vae.decode(processed_latent["samples"])
+            decoded_tiles.append(tile.cpu())  # Move to CPU immediately
+            
+            del processed_latent
+            torch.cuda.empty_cache()
+        
+        del processed_latents
+        print("Unloading VAE...")
+        SamplerHelper.force_memory_cleanup(True)
+        
+        # Phase 4: Stitch Tiles
+        print("Phase 4: Stitching Tiles")
+        # Create gaussian blend kernel
+        blend_kernel = SamplerHelper.create_gaussian_blend_kernel(tile_padding, image.device)
+        
+        for tile, pos in zip(decoded_tiles, tile_positions):
+            x1, x2, y1, y2, _, _, _, _ = pos
+            # Move tile and relevant output section to GPU for blending
+            tile_gpu = tile.to(image.device)
+            output_section = output[:, y1:y2, x1:x2, :].to(image.device)
+            
+            # Blend and store
+            blended = SamplerHelper.blend_tile_edges(tile_gpu, output_section, blend_kernel)
+            output[:, y1:y2, x1:x2, :] = blended.cpu()
+            
+            del tile_gpu, output_section
+            torch.cuda.empty_cache()
+        
+        # Clean up
+        del decoded_tiles, tile_positions
+        SamplerHelper.force_memory_cleanup(True)
+        
         # Scale image back down to target size
+        output = output.to(image.device)  # Move back to GPU for scaling
         samples = output.movedim(-1,1)  # BHWC to BCHW
-        image = comfy.utils.common_upscale(samples, settings.target_width, settings.target_height, "area", "disabled")
-        output = image.movedim(1,-1)  # BCHW to BHWC
+        output = comfy.utils.common_upscale(samples, settings.target_width, settings.target_height, "area", "disabled")
+        output = output.movedim(1,-1)  # BCHW to BHWC
         
         return (output,)
