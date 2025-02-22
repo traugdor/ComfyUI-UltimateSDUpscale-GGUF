@@ -44,20 +44,16 @@ class UpscaleSettings:
 
         # Double check that image dimensions are a multiple of 8 and adjust if necessary
         # Return as sampling dimensions
-        sampling_width = self.target_width
-        sampling_height = self.target_height
-        if self.target_width % 8 != 0:
-            sampling_width  = (self.target_width // 8 + 1) * 8
-        if self.target_height % 8 != 0:
-            sampling_height = (self.target_height // 8 + 1) * 8
+        sampling_width = max(8, ((self.target_width + 7) // 8) * 8)
+        sampling_height = max(8, ((self.target_height + 7) // 8) * 8)
         
-        # For non-uniform tiles, use square tiles
+        # For non-uniform tiles, use square tiles with minimum size constraint
         tile_size = max(64, math.ceil(self.max_tile_size / 8) * 8)
-        tile_size = min(tile_size, min(self.target_width, self.target_height))
+        tile_size = min(tile_size, max(8, min(sampling_width, sampling_height)))
         
-        # Calculate number of full tiles needed
-        self.num_tiles_x = math.ceil(self.target_width / tile_size)
-        self.num_tiles_y = math.ceil(self.target_height / tile_size)
+        # Calculate number of full tiles needed, ensuring at least 1 tile in each dimension
+        self.num_tiles_x = max(1, math.ceil(sampling_width / tile_size))
+        self.num_tiles_y = max(1, math.ceil(sampling_height / tile_size))
         
         return tile_size, tile_size, sampling_width, sampling_height
     

@@ -70,26 +70,136 @@ class UltimateSDUpscaleGGUF:
         # Initialize storage for our phases
         latents = []
         tile_positions = []
+        tile_masks = []
         
         # Phase 1: VAE Encode
-        print("Phase 1: VAE Encoding")
+        print("Phase 1: VAE Encoding and Mask Creation")
         print("Cleaning VRAM...")
         SamplerHelper.force_memory_cleanup(True)  # Ensure clean VRAM state
-        
+
+        def print_progress_grid(num_tiles_x, num_tiles_y, current_x, current_y):
+            # Detect shell type and terminal capabilities
+            is_powershell = any(k for k in os.environ if "POWERSHELL" in k.upper())
+            is_linux = os.name == 'posix'
+            term = os.environ.get('TERM', '')
+            has_ansi = term in ('xterm', 'xterm-256color', 'linux', 'screen') or 'COLORTERM' in os.environ
+            
+            # If we can't use ANSI codes, just print without cursor movement
+            if not has_ansi:
+                if current_x == 0 and current_y == 0:
+                    print("\nProcessing tiles:")
+                return
+            
+            # Calculate number of lines in the grid
+            num_lines = 3  # Header lines (top border + numbers + separator)
+            num_lines += num_tiles_y * 2  # Each row + separator
+            num_lines += 1  # Bottom border
+            
+            # Move cursor up and clear previous grid
+            if current_x > 0 or current_y > 0:
+                # Linux terminals and most modern terminals use 'A'
+                # PowerShell needs 'F'
+                cursor_up = f"\033[{num_lines}{'F' if is_powershell else 'A'}"
+                print(f"{cursor_up}\033[J", end="")
+            
+            # Box drawing characters
+            TOP_LEFT = "┌"
+            TOP_RIGHT = "┐"
+            BOTTOM_LEFT = "└"
+            BOTTOM_RIGHT = "┘"
+            HORIZONTAL = "─"
+            VERTICAL = "│"
+            T_DOWN = "┬"
+            T_UP = "┴"
+            T_RIGHT = "├"
+            T_LEFT = "┤"
+            CROSS = "┼"
+            
+            # Print top border with column numbers
+            header = "   " + TOP_LEFT
+            for x in range(num_tiles_x):
+                header += HORIZONTAL * 3
+                header += T_DOWN if x < num_tiles_x - 1 else TOP_RIGHT
+            print(header)
+            
+            # Print column numbers
+            nums = "   " + VERTICAL
+            for x in range(num_tiles_x):
+                nums += f" {x+1} "
+                nums += VERTICAL
+            print(nums)
+            
+            # Print separator
+            sep = "   " + T_RIGHT + (HORIZONTAL * 3 + CROSS) * (num_tiles_x - 1) + HORIZONTAL * 3 + T_LEFT
+            print(sep)
+            
+            # Print each row
+            for y in range(num_tiles_y):
+                row = f" {y+1} " + VERTICAL
+                for x in range(num_tiles_x):
+                    if y == current_y and x == current_x:
+                        row += " O "  # Current tile
+                    elif y > current_y or (y == current_y and x > current_x):
+                        row += "   "  # Not processed yet
+                    else:
+                        row += " X "  # Already processed
+                    row += VERTICAL
+                print(row)
+                
+                # Print row separator if not last row
+                if y < num_tiles_y - 1:
+                    print("   " + T_RIGHT + (HORIZONTAL * 3 + CROSS) * (num_tiles_x - 1) + HORIZONTAL * 3 + T_LEFT)
+            
+            # Print bottom border
+            footer = "   " + BOTTOM_LEFT
+            for x in range(num_tiles_x):
+                footer += HORIZONTAL * 3
+                footer += T_UP if x < num_tiles_x - 1 else BOTTOM_RIGHT
+            print(footer + "\n")
+
         for tile_y in range(settings.num_tiles_y):
             for tile_x in range(settings.num_tiles_x):
+                print_progress_grid(settings.num_tiles_x, settings.num_tiles_y, tile_x, tile_y)
                 # Get tile coordinates with padding
                 x1, x2, y1, y2, pad_x1, pad_x2, pad_y1, pad_y2 = settings.get_tile_coordinates(tile_x, tile_y, tile_padding)
+                
+                # 1. Create base mask of tile size
+                mask = torch.ones((1, 1, y2-y1, x2-x1), device=image.device)
+                
+                if tile_padding // 2 > 1:
+                    # 2. Pad the entire mask using tile_padding
+                    pad_size = tile_padding // 2
+                    padded_mask = F.pad(mask, (pad_size, pad_size, pad_size, pad_size))
+                    
+                    # 3. Apply gaussian blur
+                    kernel_size = int(mask_blur * 2 + 1)
+                    sigma = mask_blur * transition_sharpness # use transition sharpness to adjust sigma
+                    x = torch.arange(-(kernel_size//2), kernel_size//2 + 1, device=image.device).float()
+                    gaussian = torch.exp(-(x**2)/(2*sigma**2))
+                    gaussian = gaussian / gaussian.sum()
+                    kernel = gaussian.view(1, 1, -1, 1) @ gaussian.view(1, 1, 1, -1)
+                    
+                    blurred = F.conv2d(padded_mask, kernel, padding=kernel_size//2)
+                    
+                    # 4. Crop mask back to padded tile size
+                    mask = blurred[:, :, :pad_y2-pad_y1, :pad_x2-pad_x1]
+                    mask = torch.clamp(mask, 0, 1)
                 
                 # Extract padded tile
                 tile = image[:, pad_y1:pad_y2, pad_x1:pad_x2, :].clone()
                 
-                # Encode tile
+                # Convert tile to latent and downscale mask
                 latent = Sampler.encode(tile, vae)
+                latent_h, latent_w = latent["samples"].shape[2:4]
+                mask_latent = F.interpolate(mask, size=(latent_h, latent_w), mode='bilinear')
+                latent["noise_mask"] = mask_latent  # Use correct property name for sampler
+                
+                # Store for processing
                 latents.append(latent)
                 tile_positions.append((x1, x2, y1, y2, pad_x1, pad_x2, pad_y1, pad_y2))
+                tile_masks.append(mask)  # Store original mask for final blending
                 
-                del tile
+                del tile, mask, mask_latent
                 torch.cuda.empty_cache()
         
         # Unload VAE to free memory
@@ -121,32 +231,34 @@ class UltimateSDUpscaleGGUF:
         print("Unloading VAE...")
         SamplerHelper.force_memory_cleanup(True)
         
-        # Phase 4: Stitch Tiles
+        # Phase 4: Stitch Tiles with Blur Masks
         print("Phase 4: Stitching Tiles")
-        # Create gaussian blend kernel
-        blend_kernel = SamplerHelper.create_gaussian_blend_kernel(tile_padding, image.device)
         
-        for tile, pos in zip(decoded_tiles, tile_positions):
-            x1, x2, y1, y2, _, _, _, _ = pos
-            # Move tile and relevant output section to GPU for blending
+        for tile, pos, mask in zip(decoded_tiles, tile_positions, tile_masks):
+            x1, x2, y1, y2, pad_x1, pad_x2, pad_y1, pad_y2 = pos
+            
+            # Move tile to GPU and expand mask to match channels
             tile_gpu = tile.to(image.device)
-            output_section = output[:, y1:y2, x1:x2, :].to(image.device)
+            mask = mask.to(image.device)
+            mask = mask.expand(-1, 3, -1, -1).permute(0, 2, 3, 1)  # Convert to BHWC
             
-            # Blend and store
-            blended = SamplerHelper.blend_tile_edges(tile_gpu, output_section, blend_kernel)
-            output[:, y1:y2, x1:x2, :] = blended.cpu()
+            # Blend with existing content
+            output[:, pad_y1:pad_y2, pad_x1:pad_x2, :] = (
+                tile_gpu * mask + 
+                output[:, pad_y1:pad_y2, pad_x1:pad_x2, :].to(image.device) * (1 - mask)
+            )
             
-            del tile_gpu, output_section
+            del tile_gpu, mask
             torch.cuda.empty_cache()
         
         # Clean up
-        del decoded_tiles, tile_positions
+        del decoded_tiles, tile_positions, tile_masks
         SamplerHelper.force_memory_cleanup(True)
         
         # Scale image back down to target size
         output = output.to(image.device)  # Move back to GPU for scaling
         samples = output.movedim(-1,1)  # BHWC to BCHW
-        output = comfy.utils.common_upscale(samples, settings.target_width, settings.target_height, "area", "disabled")
+        output = comfy.utils.common_upscale(samples, settings.target_width, settings.target_height, "bicubic", "disabled")
         output = output.movedim(1,-1)  # BCHW to BHWC
         
         return (output,)

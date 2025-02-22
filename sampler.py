@@ -53,7 +53,7 @@ class SamplerHelper:
 
     @staticmethod
     def create_gaussian_blend_kernel(overlap, device):
-        # Create coordinate grid
+        """Create a gaussian blend kernel that matches BHWC format."""
         try:
             y = torch.arange(overlap, device=device).float()
             x = torch.arange(overlap, device=device).float()
@@ -76,8 +76,9 @@ class SamplerHelper:
             # Normalize kernel
             kernel = kernel / kernel.max()
             
-            # Add batch and channel dimensions
-            kernel = kernel.view(1, 1, overlap, overlap)
+            # Add batch dimension and move to BHWC format
+            # [overlap, overlap] -> [1, overlap, overlap, 1]
+            kernel = kernel.view(1, overlap, overlap, 1)
             
             return kernel
         finally:
@@ -86,27 +87,58 @@ class SamplerHelper:
 
     @staticmethod
     def blend_tile_edges(tile, existing_output, kernel):
-        overlap = kernel.shape[-1]
+        """Blend tile edges using gaussian kernel. Expects BHWC format."""
+        print(f"DEBUG: Initial shapes:")
+        print(f"  tile: {tile.shape}")
+        print(f"  existing_output: {existing_output.shape}")
+        print(f"  kernel: {kernel.shape}")
+        
+        overlap = kernel.shape[1]  # Kernel is [B,H,W,C]
         
         # Extract overlap regions
-        left = existing_output[:, :, :, :overlap] if tile.shape[-1] > overlap else None
-        right = existing_output[:, :, :, -overlap:] if tile.shape[-1] > overlap else None
-        top = existing_output[:, :, :overlap, :] if tile.shape[-2] > overlap else None
-        bottom = existing_output[:, :, -overlap:, :] if tile.shape[-2] > overlap else None
+        left = existing_output[:, :, :overlap, :] if tile.shape[2] > overlap else None
+        right = existing_output[:, :, -overlap:, :] if tile.shape[2] > overlap else None
+        top = existing_output[:, :overlap, :, :] if tile.shape[1] > overlap else None
+        bottom = existing_output[:, -overlap:, :, :] if tile.shape[1] > overlap else None
         
-        # Create kernels for each direction
-        kernel_horizontal = kernel.expand(-1, tile.shape[1], -1, -1)  # Expand to match channels
-        kernel_vertical = kernel.permute(0, 1, 3, 2).expand(-1, tile.shape[1], -1, -1)
+        if left is not None:
+            print(f"  left overlap: {left.shape}")
+        if top is not None:
+            print(f"  top overlap: {top.shape}")
+        
+        # Expand kernel to match tile dimensions
+        kernel_horizontal = kernel.expand(tile.shape[0], overlap, overlap, 1)
+        kernel_vertical = kernel.permute(0, 2, 1, 3).expand(tile.shape[0], overlap, overlap, 1)
+        
+        print(f"DEBUG: Kernel shapes after expansion:")
+        print(f"  kernel_horizontal: {kernel_horizontal.shape}")
+        print(f"  kernel_vertical: {kernel_vertical.shape}")
         
         # Blend edges
         if left is not None:
-            tile[:, :, :, :overlap] = tile[:, :, :, :overlap] * kernel_horizontal + left * (1 - kernel_horizontal)
+            # Extract the section we're blending
+            section = tile[:, :, :overlap, :]
+            print(f"  blending section shape: {section.shape}")
+            print(f"  kernel_horizontal shape: {kernel_horizontal.shape}")
+            
+            # Expand kernel to match height
+            kernel_h = kernel_horizontal.expand(-1, section.shape[1], -1, -1)
+            tile[:, :, :overlap, :] = section * kernel_h + left * (1 - kernel_h)
+            
         if right is not None:
-            tile[:, :, :, -overlap:] = tile[:, :, :, -overlap:] * kernel_horizontal.flip(-1) + right * (1 - kernel_horizontal.flip(-1))
+            section = tile[:, :, -overlap:, :]
+            kernel_h = kernel_horizontal.expand(-1, section.shape[1], -1, -1)
+            tile[:, :, -overlap:, :] = section * kernel_h.flip(2) + right * (1 - kernel_h.flip(2))
+            
         if top is not None:
-            tile[:, :, :overlap, :] = tile[:, :, :overlap, :] * kernel_vertical + top * (1 - kernel_vertical)
+            section = tile[:, :overlap, :, :]
+            kernel_v = kernel_vertical.expand(-1, -1, section.shape[2], -1)
+            tile[:, :overlap, :, :] = section * kernel_v + top * (1 - kernel_v)
+            
         if bottom is not None:
-            tile[:, :, -overlap:, :] = tile[:, :, -overlap:, :] * kernel_vertical.flip(-2) + bottom * (1 - kernel_vertical.flip(-2))
+            section = tile[:, -overlap:, :, :]
+            kernel_v = kernel_vertical.expand(-1, -1, section.shape[2], -1)
+            tile[:, -overlap:, :, :] = section * kernel_v.flip(1) + bottom * (1 - kernel_v.flip(1))
         
         return tile
 
