@@ -1,0 +1,14 @@
+[project]
+name = "ultimatesdupscale-gguf"
+description = "GGUF implementation for the ComfyUI Ultimate SD Upscale node."
+version = "1.0.0"
+license = {file = "LICENSE"}
+
+[project.urls]
+Repository = "https://github.com/traugdor/ComfyUI-UltimateSDUpscale-GGUF"
+#  Used by Comfy Registry https://comfyregistry.org
+
+[tool.comfy]
+PublisherId = ""
+DisplayName = "ComfyUI-UltimateSDUpscale-GGUF"
+Icon = ""
