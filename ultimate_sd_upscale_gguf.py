@@ -85,10 +85,11 @@ class UltimateSDUpscaleGGUF:
             has_ansi = term in ('xterm', 'xterm-256color', 'linux', 'screen') or 'COLORTERM' in os.environ
             
             # If we can't use ANSI codes, just print without cursor movement
-            if not has_ansi:
-                if current_x == 0 and current_y == 0:
-                    print("\nProcessing tiles:")
-                return
+            if not is_powershell:
+                if is_linux and not has_ansi:
+                    if current_x == 0 and current_y == 0:
+                        print(f"Processing tiles: {num_tiles_x}x{num_tiles_y}")
+                    return
             
             # Calculate number of lines in the grid
             num_lines = 3  # Header lines (top border + numbers + separator)
@@ -192,7 +193,8 @@ class UltimateSDUpscaleGGUF:
                 latent = Sampler.encode(tile, vae)
                 latent_h, latent_w = latent["samples"].shape[2:4]
                 mask_latent = F.interpolate(mask, size=(latent_h, latent_w), mode='bilinear')
-                latent["noise_mask"] = mask_latent  # Use correct property name for sampler
+                # latent["noise_mask"] = mask_latent  # removing this for now. sample the entire tile.
+                # we'll use the mask to blend it later.
                 
                 # Store for processing
                 latents.append(latent)
@@ -240,7 +242,10 @@ class UltimateSDUpscaleGGUF:
             # Move tile to GPU and expand mask to match channels
             tile_gpu = tile.to(image.device)
             mask = mask.to(image.device)
-            mask = mask.expand(-1, 3, -1, -1).permute(0, 2, 3, 1)  # Convert to BHWC
+            
+            # Convert mask from BCHW to BHWC format to match the image format
+            mask = mask.movedim(1, -1)  # This moves the channel dimension to the end
+            mask = mask.expand(-1, -1, -1, 3)  # Expand to 3 channels
             
             # Blend with existing content
             output[:, pad_y1:pad_y2, pad_x1:pad_x2, :] = (
