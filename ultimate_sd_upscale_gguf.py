@@ -77,90 +77,8 @@ class UltimateSDUpscaleGGUF:
         print("Cleaning VRAM...")
         SamplerHelper.force_memory_cleanup(True)  # Ensure clean VRAM state
 
-        def print_progress_grid(num_tiles_x, num_tiles_y, current_x, current_y):
-            # Detect shell type and terminal capabilities
-            is_powershell = any(k for k in os.environ if "POWERSHELL" in k.upper())
-            is_linux = os.name == 'posix'
-            term = os.environ.get('TERM', '')
-            has_ansi = term in ('xterm', 'xterm-256color', 'linux', 'screen') or 'COLORTERM' in os.environ
-            
-            # If we can't use ANSI codes, just print without cursor movement
-            if not is_powershell:
-                if is_linux and not has_ansi:
-                    if current_x == 0 and current_y == 0:
-                        print(f"Processing tiles: {num_tiles_x}x{num_tiles_y}")
-                    return
-            
-            # Calculate number of lines in the grid
-            num_lines = 3  # Header lines (top border + numbers + separator)
-            num_lines += num_tiles_y * 2  # Each row + separator
-            num_lines += 1  # Bottom border
-            
-            # Move cursor up and clear previous grid
-            if current_x > 0 or current_y > 0:
-                # Linux terminals and most modern terminals use 'A'
-                # PowerShell needs 'F'
-                cursor_up = f"\033[{num_lines}{'F' if is_powershell else 'A'}"
-                print(f"{cursor_up}\033[J", end="")
-            
-            # Box drawing characters
-            TOP_LEFT = "┌"
-            TOP_RIGHT = "┐"
-            BOTTOM_LEFT = "└"
-            BOTTOM_RIGHT = "┘"
-            HORIZONTAL = "─"
-            VERTICAL = "│"
-            T_DOWN = "┬"
-            T_UP = "┴"
-            T_RIGHT = "├"
-            T_LEFT = "┤"
-            CROSS = "┼"
-            
-            # Print top border with column numbers
-            header = "   " + TOP_LEFT
-            for x in range(num_tiles_x):
-                header += HORIZONTAL * 3
-                header += T_DOWN if x < num_tiles_x - 1 else TOP_RIGHT
-            print(header)
-            
-            # Print column numbers
-            nums = "   " + VERTICAL
-            for x in range(num_tiles_x):
-                nums += f" {x+1} "
-                nums += VERTICAL
-            print(nums)
-            
-            # Print separator
-            sep = "   " + T_RIGHT + (HORIZONTAL * 3 + CROSS) * (num_tiles_x - 1) + HORIZONTAL * 3 + T_LEFT
-            print(sep)
-            
-            # Print each row
-            for y in range(num_tiles_y):
-                row = f" {y+1} " + VERTICAL
-                for x in range(num_tiles_x):
-                    if y == current_y and x == current_x:
-                        row += " O "  # Current tile
-                    elif y > current_y or (y == current_y and x > current_x):
-                        row += "   "  # Not processed yet
-                    else:
-                        row += " X "  # Already processed
-                    row += VERTICAL
-                print(row)
-                
-                # Print row separator if not last row
-                if y < num_tiles_y - 1:
-                    print("   " + T_RIGHT + (HORIZONTAL * 3 + CROSS) * (num_tiles_x - 1) + HORIZONTAL * 3 + T_LEFT)
-            
-            # Print bottom border
-            footer = "   " + BOTTOM_LEFT
-            for x in range(num_tiles_x):
-                footer += HORIZONTAL * 3
-                footer += T_UP if x < num_tiles_x - 1 else BOTTOM_RIGHT
-            print(footer + "\n")
-
         for tile_y in range(settings.num_tiles_y):
             for tile_x in range(settings.num_tiles_x):
-                print_progress_grid(settings.num_tiles_x, settings.num_tiles_y, tile_x, tile_y)
                 # Get tile coordinates with padding
                 x1, x2, y1, y2, pad_x1, pad_x2, pad_y1, pad_y2 = settings.get_tile_coordinates(tile_x, tile_y, tile_padding)
                 
@@ -187,6 +105,9 @@ class UltimateSDUpscaleGGUF:
                     mask = torch.clamp(mask, 0, 1)
                 
                 # Extract padded tile
+                print(f"Padded Tile coordinates: {pad_x1} {pad_x2} {pad_y1} {pad_y2}")
+                print(f"Extracting tile of size: {pad_x2-pad_x1}x{pad_y2-pad_y1}")
+                print(f"     Original tile size: {x2-x1}x{y2-y1}")
                 tile = image[:, pad_y1:pad_y2, pad_x1:pad_x2, :].clone()
                 
                 # Convert tile to latent and downscale mask
