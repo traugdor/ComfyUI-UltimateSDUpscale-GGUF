@@ -82,40 +82,50 @@ class UltimateSDUpscaleGGUF:
                 # Get tile coordinates with padding
                 x1, x2, y1, y2, pad_x1, pad_x2, pad_y1, pad_y2 = settings.get_tile_coordinates(tile_x, tile_y, tile_padding)
                 
-                # 1. Create base mask of tile size
-                mask = torch.ones((1, 1, y2-y1, x2-x1), device=image.device)
+                if tile_padding > 0:
+                    # Create a padded mask that's larger than we need
+                    pad = tile_padding
+                    full_h, full_w = (y2-y1) + pad*2, (x2-x1) + pad*2
+                    mask = torch.zeros((1, 1, full_h, full_w), device=image.device)
+                    
+                    # Fill the center with ones (actual tile area)
+                    mask[:, :, pad:pad+(y2-y1), pad:pad+(x2-x1)] = 1.0
+                    
+                    if mask_blur > 0:
+                        # Apply gaussian blur
+                        kernel_size = int(mask_blur * 2 + 1)
+                        sigma = mask_blur * transition_sharpness
+                        x = torch.arange(-(kernel_size//2), kernel_size//2 + 1, device=image.device).float()
+                        gaussian = torch.exp(-(x**2)/(2*sigma**2))
+                        gaussian = gaussian / gaussian.sum()
+                        kernel = gaussian.view(1, 1, -1, 1) @ gaussian.view(1, 1, 1, -1)
+                        
+                        mask = F.conv2d(mask, kernel, padding=(kernel_size-1) // 2)
+                    
+                    # Fill the center with ones (actual tile area) again to ensure no edge artifacts
+                    mask[:, :, pad:pad+(y2-y1), pad:pad+(x2-x1)] = 1.0
+                    
+                    # Crop the mask to the final padded tile size
+                    # Only crop edges that touch image boundary
+                    x_start = 0 if tile_x > 0 else pad
+                    x_end = full_w if tile_x < settings.num_tiles_x - 1 else full_w - pad
+                    y_start = 0 if tile_y > 0 else pad
+                    y_end = full_h if tile_y < settings.num_tiles_y - 1 else full_h - pad
+                    
+                    mask = mask[:, :, y_start:y_end, x_start:x_end]
+                else:
+                    # If no padding, just use a mask of ones
+                    mask = torch.ones((1, 1, y2-y1, x2-x1), device=image.device)
                 
-                if tile_padding // 2 > 1:
-                    # 2. Pad the entire mask using tile_padding
-                    pad_size = tile_padding // 2
-                    padded_mask = F.pad(mask, (pad_size, pad_size, pad_size, pad_size))
-                    
-                    # 3. Apply gaussian blur
-                    kernel_size = int(mask_blur * 2 + 1)
-                    sigma = mask_blur * transition_sharpness # use transition sharpness to adjust sigma
-                    x = torch.arange(-(kernel_size//2), kernel_size//2 + 1, device=image.device).float()
-                    gaussian = torch.exp(-(x**2)/(2*sigma**2))
-                    gaussian = gaussian / gaussian.sum()
-                    kernel = gaussian.view(1, 1, -1, 1) @ gaussian.view(1, 1, 1, -1)
-                    
-                    blurred = F.conv2d(padded_mask, kernel, padding=kernel_size//2)
-                    
-                    # 4. Crop mask back to padded tile size
-                    mask = blurred[:, :, :pad_y2-pad_y1, :pad_x2-pad_x1]
-                    mask = torch.clamp(mask, 0, 1)
+                mask = torch.clamp(mask, 0, 1)
                 
                 # Extract padded tile
-                print(f"Padded Tile coordinates: {pad_x1} {pad_x2} {pad_y1} {pad_y2}")
-                print(f"Extracting tile of size: {pad_x2-pad_x1}x{pad_y2-pad_y1}")
-                print(f"     Original tile size: {x2-x1}x{y2-y1}")
                 tile = image[:, pad_y1:pad_y2, pad_x1:pad_x2, :].clone()
                 
                 # Convert tile to latent and downscale mask
                 latent = Sampler.encode(tile, vae)
                 latent_h, latent_w = latent["samples"].shape[2:4]
                 mask_latent = F.interpolate(mask, size=(latent_h, latent_w), mode='bilinear')
-                # latent["noise_mask"] = mask_latent  # removing this for now. sample the entire tile.
-                # we'll use the mask to blend it later.
                 
                 # Store for processing
                 latents.append(latent)
@@ -160,18 +170,38 @@ class UltimateSDUpscaleGGUF:
         for tile, pos, mask in zip(decoded_tiles, tile_positions, tile_masks):
             x1, x2, y1, y2, pad_x1, pad_x2, pad_y1, pad_y2 = pos
             
+            print(f"\nTile Position Info:")
+            print(f"Original bounds: ({x1}, {x2}, {y1}, {y2})")
+            print(f"Padded bounds: ({pad_x1}, {pad_x2}, {pad_y1}, {pad_y2})")
+            print(f"Tile shape: {tile.shape}")
+            
             # Move tile to GPU and expand mask to match channels
             tile_gpu = tile.to(image.device)
             mask = mask.to(image.device)
+            
+            print(f"Mask Info (before format change):")
+            print(f"Mask shape: {mask.shape}")
+            print(f"Mask value range: ({mask.min().item():.3f}, {mask.max().item():.3f})")
+            print(f"Mask edge values (left, right, top, bottom):")
+            print(f"  Left:   {mask[0,0,0,0].item():.3f}")
+            print(f"  Right:  {mask[0,0,-1,0].item():.3f}")
+            print(f"  Top:    {mask[0,0,0,0].item():.3f}")
+            print(f"  Bottom: {mask[0,0,0,-1].item():.3f}")
             
             # Convert mask from BCHW to BHWC format to match the image format
             mask = mask.movedim(1, -1)  # This moves the channel dimension to the end
             mask = mask.expand(-1, -1, -1, 3)  # Expand to 3 channels
             
+            print(f"Mask Info (after format change):")
+            print(f"Mask shape: {mask.shape}")
+            print(f"Expected shape based on padded bounds: ({pad_y2-pad_y1}, {pad_x2-pad_x1}, 3)")
+            
             # Blend with existing content
+            output_slice = output[:, pad_y1:pad_y2, pad_x1:pad_x2, :]
+            print(f"Output slice shape: {output_slice.shape}")
             output[:, pad_y1:pad_y2, pad_x1:pad_x2, :] = (
                 tile_gpu * mask + 
-                output[:, pad_y1:pad_y2, pad_x1:pad_x2, :].to(image.device) * (1 - mask)
+                output_slice.to(image.device) * (1 - mask)
             )
             
             del tile_gpu, mask
@@ -184,7 +214,7 @@ class UltimateSDUpscaleGGUF:
         # Scale image back down to target size
         output = output.to(image.device)  # Move back to GPU for scaling
         samples = output.movedim(-1,1)  # BHWC to BCHW
-        output = comfy.utils.common_upscale(samples, settings.target_width, settings.target_height, "bicubic", "disabled")
+        output = comfy.utils.common_upscale(samples, settings.target_width, settings.target_height, "area", "disabled")
         output = output.movedim(1,-1)  # BCHW to BHWC
         
         return (output,)

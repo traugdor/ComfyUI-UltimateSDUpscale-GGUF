@@ -21,27 +21,6 @@ import comfy.model_management
 # Get the current device
 device = comfy.model_management.get_torch_device()
 
-# Get VRAM information
-total_vram, torch_total_vram = comfy.model_management.get_total_memory(device, torch_total_too=True)
-free_vram, torch_free_vram = comfy.model_management.get_free_memory(device, torch_free_too=True)
-
-# Convert to GB for better readability
-total_vram_gb = total_vram / (1024 * 1024 * 1024)
-free_vram_gb = free_vram / (1024 * 1024 * 1024)
-
-# Check for reserved VRAM from command line args (--reserve-vram CLI arg becomes reserve_vram in args)
-reserved_vram = getattr(args, 'reserve_vram', 0)
-if reserved_vram > 0:
-    # Convert MB to bytes since reserve_vram is specified in MB
-    reserved_vram_bytes = reserved_vram * 1024 * 1024
-    free_vram -= reserved_vram_bytes
-    free_vram_gb = free_vram / (1024 * 1024 * 1024)
-
-# Store these for use in the sampler
-VRAM_TOTAL = total_vram
-VRAM_FREE = free_vram
-VRAM_RESERVED = reserved_vram * 1024 * 1024 if reserved_vram > 0 else 0
-
 class SamplerHelper:
     @staticmethod
     def force_memory_cleanup(unload_models=False):
@@ -88,11 +67,6 @@ class SamplerHelper:
     @staticmethod
     def blend_tile_edges(tile, existing_output, kernel):
         """Blend tile edges using gaussian kernel. Expects BHWC format."""
-        print(f"DEBUG: Initial shapes:")
-        print(f"  tile: {tile.shape}")
-        print(f"  existing_output: {existing_output.shape}")
-        print(f"  kernel: {kernel.shape}")
-        
         overlap = kernel.shape[1]  # Kernel is [B,H,W,C]
         
         # Extract overlap regions
@@ -101,44 +75,19 @@ class SamplerHelper:
         top = existing_output[:, :overlap, :, :] if tile.shape[1] > overlap else None
         bottom = existing_output[:, -overlap:, :, :] if tile.shape[1] > overlap else None
         
-        if left is not None:
-            print(f"  left overlap: {left.shape}")
-        if top is not None:
-            print(f"  top overlap: {top.shape}")
-        
-        # Expand kernel to match tile dimensions
-        kernel_horizontal = kernel.expand(tile.shape[0], overlap, overlap, 1)
-        kernel_vertical = kernel.permute(0, 2, 1, 3).expand(tile.shape[0], overlap, overlap, 1)
-        
-        print(f"DEBUG: Kernel shapes after expansion:")
-        print(f"  kernel_horizontal: {kernel_horizontal.shape}")
-        print(f"  kernel_vertical: {kernel_vertical.shape}")
+        # Create kernels for each direction
+        kernel_horizontal = kernel  # Already in BHWC format
+        kernel_vertical = kernel.permute(0, 2, 1, 3)  # Swap H,W for vertical blending
         
         # Blend edges
         if left is not None:
-            # Extract the section we're blending
-            section = tile[:, :, :overlap, :]
-            print(f"  blending section shape: {section.shape}")
-            print(f"  kernel_horizontal shape: {kernel_horizontal.shape}")
-            
-            # Expand kernel to match height
-            kernel_h = kernel_horizontal.expand(-1, section.shape[1], -1, -1)
-            tile[:, :, :overlap, :] = section * kernel_h + left * (1 - kernel_h)
-            
+            tile[:, :, :overlap, :] = tile[:, :, :overlap, :] * kernel_horizontal + left * (1 - kernel_horizontal)
         if right is not None:
-            section = tile[:, :, -overlap:, :]
-            kernel_h = kernel_horizontal.expand(-1, section.shape[1], -1, -1)
-            tile[:, :, -overlap:, :] = section * kernel_h.flip(2) + right * (1 - kernel_h.flip(2))
-            
+            tile[:, :, -overlap:, :] = tile[:, :, -overlap:, :] * kernel_horizontal.flip(2) + right * (1 - kernel_horizontal.flip(2))
         if top is not None:
-            section = tile[:, :overlap, :, :]
-            kernel_v = kernel_vertical.expand(-1, -1, section.shape[2], -1)
-            tile[:, :overlap, :, :] = section * kernel_v + top * (1 - kernel_v)
-            
+            tile[:, :overlap, :, :] = tile[:, :overlap, :, :] * kernel_vertical + top * (1 - kernel_vertical)
         if bottom is not None:
-            section = tile[:, -overlap:, :, :]
-            kernel_v = kernel_vertical.expand(-1, -1, section.shape[2], -1)
-            tile[:, -overlap:, :, :] = section * kernel_v.flip(1) + bottom * (1 - kernel_v.flip(1))
+            tile[:, -overlap:, :, :] = tile[:, -overlap:, :, :] * kernel_vertical.flip(1) + bottom * (1 - kernel_vertical.flip(1))
         
         return tile
 
