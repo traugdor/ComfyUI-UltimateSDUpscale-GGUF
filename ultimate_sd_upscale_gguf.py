@@ -33,7 +33,7 @@ class UltimateSDUpscaleGGUF:
                 "upscale_by": ("FLOAT", { "default": 2.0, "min": 1.0, "max": 8.0, "step": 0.1 }),
                 "max_tile_size": ("INT", { "default": 512, "min": 256, "max": 2048, "step": 64 }),
                 "mask_blur": ("INT", { "default": 8, "min": 0, "max": 64, "step": 1 }),
-                "transition_sharpness": ("FLOAT", { "default": 0.33, "min": 0.0, "max": 1.0, "step": 0.01 }),
+                "transition_sharpness": ("FLOAT", { "default": 0.333, "min": 0.125, "max": 1.0, "step": 0.001 }),
                 "tile_padding": ("INT", { "default": 32, "min": 0, "max": 128, "step": 8 }),
                 "seam_fix_mode": ("STRING", { "default": "None", "options": ["None", "Band Pass", "Half Tile", "Half Tile + Intersections"] }),
                 "seam_fix_width": ("INT", { "default": 64, "min": 0, "max": 8192, "step": 8 }),
@@ -42,7 +42,8 @@ class UltimateSDUpscaleGGUF:
                 "force_uniform_tiles": ("BOOLEAN", { "default": True })
         }}
 
-    RETURN_TYPES = ("IMAGE",)
+    RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE")  # (upscaled_image, tiles, masks)
+    RETURN_NAMES = ("upscaled", "tiles", "masks")
     FUNCTION = "upscale"
     CATEGORY = "image/upscaling"
 
@@ -71,7 +72,7 @@ class UltimateSDUpscaleGGUF:
         image = image.movedim(1,-1)  # BHWC to BCHW
         
         # Create output tensor on CPU to save VRAM
-        output = torch.zeros_like(image, device='cpu')
+        output = image.to('cpu')
         
         # Initialize storage for our phases
         latents = []
@@ -94,18 +95,48 @@ class UltimateSDUpscaleGGUF:
                     full_h, full_w = (y2-y1) + pad*2, (x2-x1) + pad*2
                     mask = torch.zeros((1, 1, full_h, full_w), device=image.device)
                     
-                    # Fill the center with ones (actual tile area)
-                    mask[:, :, pad:pad+(y2-y1), pad:pad+(x2-x1)] = 1.0
+                    # Create coordinates for the full padded area
+                    y_coords = torch.arange(full_h, device=image.device).view(-1, 1)
+                    x_coords = torch.arange(full_w, device=image.device).view(1, -1)
+                    
+                    # Set up tile boundaries in the padded coordinate space
+                    tile_y1, tile_y2 = pad, pad + (y2-y1)  # Tile y-bounds in padded space
+                    tile_x1, tile_x2 = pad, pad + (x2-x1)  # Tile x-bounds in padded space
+                    
+                    # Calculate distances from the actual tile boundaries
+                    dist_from_y1 = torch.abs(y_coords - tile_y1)
+                    dist_from_y2 = torch.abs(y_coords - tile_y2)
+                    dist_from_x1 = torch.abs(x_coords - tile_x1)
+                    dist_from_x2 = torch.abs(x_coords - tile_x2)
+                    
+                    # For each point, get distance to nearest tile boundary
+                    y_dist = torch.minimum(dist_from_y1, dist_from_y2)
+                    x_dist = torch.minimum(dist_from_x1, dist_from_x2)
+                    
+                    # Points inside the tile should have distance 0
+                    y_dist = torch.where((y_coords >= tile_y1) & (y_coords <= tile_y2), 0, y_dist)
+                    x_dist = torch.where((x_coords >= tile_x1) & (x_coords <= tile_x2), 0, x_dist)
+                    
+                    # Combine x and y distances using Euclidean distance
+                    dist = torch.sqrt(y_dist**2 + x_dist**2)
+                    
+                    # Create smooth falloff based on distance
+                    # Normalize by padding size for smooth transition to edges
+                    falloff = 1.0 - torch.clamp(dist / pad, min=0, max=1)
+                    mask[0, 0] = falloff
                     
                     if mask_blur > 0:
-                        # Apply gaussian blur
-                        kernel_size = int(mask_blur * 2 + 1)
-                        sigma = mask_blur * transition_sharpness
+                        # Use larger kernel size based on padding to ensure blur reaches edges
+                        kernel_size = min(pad * 2 - 1, 63)  # Make kernel size close to padding size, max 63
+                        sigma = pad / 2 * math.ceil(1.0 / transition_sharpness) / 4 # Adjust sigma based on padding size
+                        
+                        # Create and normalize gaussian kernel
                         x = torch.arange(-(kernel_size//2), kernel_size//2 + 1, device=image.device).float()
                         gaussian = torch.exp(-(x**2)/(2*sigma**2))
                         gaussian = gaussian / gaussian.sum()
                         kernel = gaussian.view(1, 1, -1, 1) @ gaussian.view(1, 1, 1, -1)
                         
+                        # Apply gaussian blur
                         mask = F.conv2d(mask, kernel, padding=(kernel_size-1) // 2)
                     
                     # Fill the center with ones (actual tile area) again to ensure no edge artifacts
@@ -170,8 +201,12 @@ class UltimateSDUpscaleGGUF:
         print("Unloading VAE...")
         SamplerHelper.force_memory_cleanup(True)
         
-        # Phase 4: Stitch Tiles with Blur Masks
-        print("Phase 4: Stitching Tiles")
+        # Create lists to store our tiles and masks
+        all_tiles = []
+        all_masks = []
+        
+        # Phase 4: Process tiles and collect them
+        print("Phase 4: Processing Tiles")
         
         for tile, pos, mask in zip(decoded_tiles, tile_positions, tile_masks):
             x1, x2, y1, y2, pad_x1, pad_x2, pad_y1, pad_y2 = pos
@@ -204,17 +239,24 @@ class UltimateSDUpscaleGGUF:
             
             # Blend with existing content
             output_slice = output[:, pad_y1:pad_y2, pad_x1:pad_x2, :]
-            print(f"Output slice shape: {output_slice.shape}")
+            #print(f"Output slice shape: {output_slice.shape}")
             output[:, pad_y1:pad_y2, pad_x1:pad_x2, :] = (
                 tile_gpu * mask + 
                 output_slice.to(image.device) * (1 - mask)
             )
+            # Store tile and mask
+            all_tiles.append(tile_gpu.cpu())
+            all_masks.append(mask.cpu())
             
             del tile_gpu, mask
             torch.cuda.empty_cache()
         
+        # Stack tiles and masks into single tensors
+        tiles_tensor = torch.cat(all_tiles, dim=0)  # Stack along batch dimension
+        masks_tensor = torch.cat(all_masks, dim=0)  # Stack along batch dimension
+        
         # Clean up
-        del decoded_tiles, tile_positions, tile_masks
+        del decoded_tiles, tile_positions, tile_masks, all_tiles, all_masks
         SamplerHelper.force_memory_cleanup(True)
         
         # Scale image back down to target size
@@ -223,4 +265,4 @@ class UltimateSDUpscaleGGUF:
         output = comfy.utils.common_upscale(samples, settings.target_width, settings.target_height, "lanczos", "disabled")
         output = output.movedim(1,-1)  # BCHW to BHWC
         
-        return (output,)
+        return (output, tiles_tensor, masks_tensor)
