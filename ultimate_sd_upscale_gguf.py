@@ -14,6 +14,7 @@ if COMFY_DIR not in sys.path:
     sys.path.append(COMFY_DIR)
 
 import comfy.utils
+import comfy_extras.nodes_upscale_model as numodel
 from .upscale_settings import UpscaleSettings
 from .sampler import SamplerHelper, Sampler
 from .seam_fixer import SeamFixer
@@ -28,6 +29,7 @@ class UltimateSDUpscaleGGUF:
                 "sampler": ("SAMPLER", ),
                 "sigmas": ("SIGMAS", ),
                 "vae": ("VAE", ),
+                "upscale_model": ("UPSCALE_MODEL",),
                 "upscale_by": ("FLOAT", { "default": 2.0, "min": 1.0, "max": 8.0, "step": 0.1 }),
                 "max_tile_size": ("INT", { "default": 512, "min": 256, "max": 2048, "step": 64 }),
                 "mask_blur": ("INT", { "default": 8, "min": 0, "max": 64, "step": 1 }),
@@ -45,7 +47,7 @@ class UltimateSDUpscaleGGUF:
     CATEGORY = "image/upscaling"
 
     def upscale(
-            self, image, noise, guider, sampler, sigmas, vae, upscale_by, max_tile_size,
+            self, image, noise, guider, sampler, sigmas, vae, upscale_model, upscale_by, max_tile_size,
             mask_blur, transition_sharpness, tile_padding, seam_fix_mode, seam_fix_width, 
             seam_fix_mask_blur, seam_fix_padding, force_uniform_tiles
         ):
@@ -59,10 +61,14 @@ class UltimateSDUpscaleGGUF:
             force_uniform_tiles=force_uniform_tiles
         )
 
-        # Step 2: Upscale image using bicubic
+        # Step 2: Upscale image using model (for better clarity and it just looks better in the output)
+        upScalerWithModel = numodel.ImageUpscaleWithModel()
+        image_tuple = upScalerWithModel.upscale(upscale_model, image)
+        image = image_tuple[0]
+        #downscale back to target size
         samples = image.movedim(-1,1)  # BHWC to BCHW
-        image = comfy.utils.common_upscale(samples, settings.sampling_width, settings.sampling_height, "bicubic", "disabled")
-        image = image.movedim(1,-1)  # BCHW to BHWC
+        image = comfy.utils.common_upscale(samples, settings.sampling_width, settings.sampling_height, "area", "disabled")
+        image = image.movedim(1,-1)  # BHWC to BCHW
         
         # Create output tensor on CPU to save VRAM
         output = torch.zeros_like(image, device='cpu')
@@ -170,31 +176,31 @@ class UltimateSDUpscaleGGUF:
         for tile, pos, mask in zip(decoded_tiles, tile_positions, tile_masks):
             x1, x2, y1, y2, pad_x1, pad_x2, pad_y1, pad_y2 = pos
             
-            print(f"\nTile Position Info:")
-            print(f"Original bounds: ({x1}, {x2}, {y1}, {y2})")
-            print(f"Padded bounds: ({pad_x1}, {pad_x2}, {pad_y1}, {pad_y2})")
-            print(f"Tile shape: {tile.shape}")
+            # print(f"\nTile Position Info:")
+            # print(f"Original bounds: ({x1}, {x2}, {y1}, {y2})")
+            # print(f"Padded bounds: ({pad_x1}, {pad_x2}, {pad_y1}, {pad_y2})")
+            # print(f"Tile shape: {tile.shape}")
             
             # Move tile to GPU and expand mask to match channels
             tile_gpu = tile.to(image.device)
             mask = mask.to(image.device)
             
-            print(f"Mask Info (before format change):")
-            print(f"Mask shape: {mask.shape}")
-            print(f"Mask value range: ({mask.min().item():.3f}, {mask.max().item():.3f})")
-            print(f"Mask edge values (left, right, top, bottom):")
-            print(f"  Left:   {mask[0,0,0,0].item():.3f}")
-            print(f"  Right:  {mask[0,0,-1,0].item():.3f}")
-            print(f"  Top:    {mask[0,0,0,0].item():.3f}")
-            print(f"  Bottom: {mask[0,0,0,-1].item():.3f}")
+            # print(f"Mask Info (before format change):")
+            # print(f"Mask shape: {mask.shape}")
+            # print(f"Mask value range: ({mask.min().item():.3f}, {mask.max().item():.3f})")
+            # print(f"Mask edge values (left, right, top, bottom):")
+            # print(f"  Left:   {mask[0,0,0,0].item():.3f}")
+            # print(f"  Right:  {mask[0,0,-1,0].item():.3f}")
+            # print(f"  Top:    {mask[0,0,0,0].item():.3f}")
+            # print(f"  Bottom: {mask[0,0,0,-1].item():.3f}")
             
             # Convert mask from BCHW to BHWC format to match the image format
             mask = mask.movedim(1, -1)  # This moves the channel dimension to the end
             mask = mask.expand(-1, -1, -1, 3)  # Expand to 3 channels
             
-            print(f"Mask Info (after format change):")
-            print(f"Mask shape: {mask.shape}")
-            print(f"Expected shape based on padded bounds: ({pad_y2-pad_y1}, {pad_x2-pad_x1}, 3)")
+            # print(f"Mask Info (after format change):")
+            # print(f"Mask shape: {mask.shape}")
+            # print(f"Expected shape based on padded bounds: ({pad_y2-pad_y1}, {pad_x2-pad_x1}, 3)")
             
             # Blend with existing content
             output_slice = output[:, pad_y1:pad_y2, pad_x1:pad_x2, :]
@@ -214,7 +220,7 @@ class UltimateSDUpscaleGGUF:
         # Scale image back down to target size
         output = output.to(image.device)  # Move back to GPU for scaling
         samples = output.movedim(-1,1)  # BHWC to BCHW
-        output = comfy.utils.common_upscale(samples, settings.target_width, settings.target_height, "area", "disabled")
+        output = comfy.utils.common_upscale(samples, settings.target_width, settings.target_height, "lanczos", "disabled")
         output = output.movedim(1,-1)  # BCHW to BHWC
         
         return (output,)
